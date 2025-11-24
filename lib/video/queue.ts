@@ -1,5 +1,7 @@
 import { createClient } from "@/lib/supabase/server"
 import { ProcessingLogger, PROCESSING_STEPS } from "./processing-logger"
+import { createDubOverlay } from "../ai/dubbing"
+import fs from "fs"
 
 export type JobStatus = "pending" | "downloading" | "transcribing" | "analyzing" | "processing" | "completed" | "failed"
 
@@ -20,6 +22,16 @@ export async function processVideoJob(projectId: string, youtubeUrl: string): Pr
 
   try {
     await logger.initializeSteps()
+
+    const { data: project, error: projectFetchError } = await supabase
+      .from("projects")
+      .select("*")
+      .eq("id", projectId)
+      .single()
+
+    if (projectFetchError || !project) {
+      throw new Error("Projeto não encontrado para processamento")
+    }
 
     // Step 1: Download video info
     await logger.updateStep(
@@ -70,7 +82,8 @@ export async function processVideoJob(projectId: string, youtubeUrl: string): Pr
     )
 
     const { transcribeAudio } = await import("../ai/transcription")
-    const transcription = await transcribeAudio(Buffer.from("mock"), "pt-BR")
+    const audioBuffer = fs.existsSync(audioPath) ? fs.readFileSync(audioPath) : Buffer.from("mock")
+    const transcription = await transcribeAudio(audioBuffer, "pt-BR")
 
     await logger.updateStep(
       PROCESSING_STEPS.TRANSCRIPTION.order,
@@ -99,6 +112,7 @@ export async function processVideoJob(projectId: string, youtubeUrl: string): Pr
     let minDuration = 10
     let maxDuration = 60
 
+    let targetDubLanguage = "en-US"
     if (user) {
       const { data: settings } = await supabase.from("admin_settings").select("*").eq("user_id", user.id)
 
@@ -107,9 +121,14 @@ export async function processVideoJob(projectId: string, youtubeUrl: string): Pr
         maxClips = Number.parseInt(settingsMap.get("max_clips_per_project") || "10")
         minDuration = Number.parseInt(settingsMap.get("min_clip_duration") || "10")
         maxDuration = Number.parseInt(settingsMap.get("max_clip_duration") || "60")
+        targetDubLanguage = settingsMap.get("default_dub_language") || targetDubLanguage
 
-        console.log("[v0] Configurações carregadas:", { maxClips, minDuration, maxDuration })
+        console.log("[v0] Configurações carregadas:", { maxClips, minDuration, maxDuration, targetDubLanguage })
       }
+    }
+
+    if (project?.metadata?.target_language) {
+      targetDubLanguage = project.metadata.target_language
     }
 
     // Pass settings to analysis
@@ -160,6 +179,7 @@ export async function processVideoJob(projectId: string, youtubeUrl: string): Pr
           end_time: suggestion.endTime,
           status: "completed",
           thumbnail_url: `/placeholder.svg?height=720&width=1280&query=${encodeURIComponent(suggestion.title)}`,
+          output_url: `/placeholder.svg?height=1080&width=1920&query=${encodeURIComponent(suggestion.title)}`,
         })
         .select()
         .single()
@@ -168,6 +188,68 @@ export async function processVideoJob(projectId: string, youtubeUrl: string): Pr
         console.error(`[v0] Error creating clip ${i + 1}:`, error)
       } else {
         console.log(`[v0] Clip ${i + 1} created successfully with ID:`, clip.id)
+      }
+
+      if (clip) {
+        await supabase.from("ai_clip_insights").insert({
+          clip_id: clip.id,
+          project_id: projectId,
+          hook: suggestion.hook,
+          keywords: suggestion.keywords,
+          score: suggestion.score,
+          summary: suggestion.description,
+          language: transcription.language,
+        })
+
+        const dubbingOverlay = await createDubOverlay({
+          clipId: clip.id,
+          projectId: projectId,
+          clipTitle: suggestion.title,
+          clipText: suggestion.description || suggestion.hook || suggestion.title,
+          sourceLanguage: transcription.language,
+          targetLanguage: targetDubLanguage,
+          transcriptSegments: transcription.segments,
+        })
+
+        await supabase.from("ai_dub_tasks").insert({
+          clip_id: clip.id,
+          project_id: projectId,
+          status: "completed",
+          target_language: dubbingOverlay.targetLanguage,
+          voice_profile: dubbingOverlay.voiceProfile,
+          output_url: dubbingOverlay.audioUrl,
+          metadata: {
+            script: dubbingOverlay.script,
+          },
+        })
+
+        await supabase.from("ai_dub_overlays").insert({
+          clip_id: clip.id,
+          project_id: projectId,
+          language: dubbingOverlay.targetLanguage,
+          overlay_url: dubbingOverlay.overlayUrl,
+          captions: dubbingOverlay.captions,
+          metadata: {
+            source_language: transcription.language,
+          },
+        })
+
+        await supabase.from("ai_clip_downloads").insert({
+          clip_id: clip.id,
+          project_id: projectId,
+          format: "mp4",
+          resolution: "1080p",
+          download_url: dubbingOverlay.overlayUrl,
+          metadata: {
+            includes_dubbing: true,
+            target_language: targetDubLanguage,
+          },
+        })
+
+        await supabase
+          .from("clips")
+          .update({ output_url: dubbingOverlay.overlayUrl })
+          .eq("id", clip.id)
       }
 
       // Update progress
@@ -210,12 +292,16 @@ export async function processVideoJob(projectId: string, youtubeUrl: string): Pr
 
     await logger.updateStep(PROCESSING_STEPS.VIDEO_EDITING.order, "completed", "Edição de vídeo concluída")
 
-    // Step 8: Prepare audio/dubbing (future feature)
-    await logger.updateStep(PROCESSING_STEPS.DUBBING.order, "processing", "Preparando áudio otimizado...")
-
-    await new Promise((resolve) => setTimeout(resolve, 1500))
-
-    await logger.updateStep(PROCESSING_STEPS.DUBBING.order, "completed", "Áudio processado")
+    // Step 8: Prepare audio/dubbing (now includes AI overlay metadata)
+    await logger.updateStep(
+      PROCESSING_STEPS.DUBBING.order,
+      "completed",
+      "Redublagem criada e overlay aplicado nos clips",
+      {
+        targetLanguage: project?.metadata?.target_language || targetDubLanguage,
+        overlay: true,
+      },
+    )
 
     // Step 9: Finalize
     await logger.updateStep(PROCESSING_STEPS.FINALIZATION.order, "processing", "Finalizando e preparando downloads...")
